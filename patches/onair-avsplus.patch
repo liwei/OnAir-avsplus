@@ -1,0 +1,154 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1acbe57..65ba388 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -58,8 +58,21 @@ if(DECT2_FFMPEG_PREFIX)
+   add_library(dect2_ffmpeg INTERFACE)
+   target_include_directories(dect2_ffmpeg INTERFACE ${DECT2_FFMPEG_PREFIX}/include)
+   target_link_directories(dect2_ffmpeg INTERFACE ${DECT2_FFMPEG_PREFIX}/lib)
+-  # the static libraries and what they need (pkg-config's --static output)
+-  target_link_libraries(dect2_ffmpeg INTERFACE ${FFMPEG_ST_STATIC_LDFLAGS})
++  # the static libraries and what they need (pkg-config's --static output); a macOS "-framework X" arrives as two list
++  # items, which CMake would link as -lX: join them again
++  set(_ffmpeg_ldflags "")
++  set(_framework OFF)
++  foreach(_f IN LISTS FFMPEG_ST_STATIC_LDFLAGS)
++    if(_framework)
++      list(APPEND _ffmpeg_ldflags "-framework ${_f}")
++      set(_framework OFF)
++    elseif(_f STREQUAL "-framework")
++      set(_framework ON)
++    else()
++      list(APPEND _ffmpeg_ldflags "${_f}")
++    endif()
++  endforeach()
++  target_link_libraries(dect2_ffmpeg INTERFACE ${_ffmpeg_ldflags})
+   add_library(PkgConfig::FFMPEG ALIAS dect2_ffmpeg)
+   message(STATUS "FFmpeg: static build in ${DECT2_FFMPEG_PREFIX}")
+ else()
+diff --git a/app/codec_help.cpp b/app/codec_help.cpp
+index 4fc5430..eb25c37 100644
+--- a/app/codec_help.cpp
++++ b/app/codec_help.cpp
+@@ -149,7 +149,8 @@ Text textOf(CodecHelp c) {
+                 "OnAir plays them through the FFmpeg built into it and ships no codec of its own. FFmpeg decodes AVS1 in its JiZhun profile, "
+                 "but not AVS+ (the broadcast profile), and AVS2 and AVS3 only when it was built with libdavs2 or libuavs3d, which the FFmpeg in "
+                 "OnAir is not. The service list, the sound and the guide work without the picture.",
+-                "There is no free AVS+ decoder to install at this time. For AVS2 or AVS3, save the stream (Outputs: file or UDP) and play it "
++                "No distribution's FFmpeg decodes AVS+. An OnAir built against an FFmpeg whose cavs decoder lists the Guangdian profile (the "
++                "ffmpeg_cavs_dra patch, see docs/CODECS.md) plays it. For AVS2 or AVS3, save the stream (Outputs: file or UDP) and play it "
+                 "with an FFmpeg build that includes libdavs2 or libuavs3d (ffplay). Check the patent rules where you live first.",
+                 false};
+     case CodecHelp::DraTv:
+diff --git a/core/include/dect2/player.h b/core/include/dect2/player.h
+index 59bc47e..b76377d 100644
+--- a/core/include/dect2/player.h
++++ b/core/include/dect2/player.h
+@@ -65,8 +65,9 @@ struct PlayerStats {
+ // The profile_id of the first AVS1-P2 / AVS+ sequence header (start code 00 00 01 B0) in p, -1 when there is none
+ int avsProfileId(const uint8_t* p, size_t n);
+ // Why an AVS family video stream gives no picture: codec as FFmpeg names it ("cavs", "avs2", "avs3"), whether this FFmpeg has a decoder for
+-// it, the profile from avsProfileId() (-1 not seen yet). Empty when it can be decoded (or nothing is known yet).
+-std::string avsVideoNote(const std::string& codec, bool haveDecoder, int profile);
++// it, the profile from avsProfileId() (-1 not seen yet) and whether the decoder lists that profile (AVCodec::profiles; FFmpeg's own cavs
++// decoder lists none and plays JiZhun only). Empty when it can be decoded (or nothing is known yet).
++std::string avsVideoNote(const std::string& codec, bool haveDecoder, int profile, bool decoderHasProfile = false);
+ extern const char* const kDraAudioNote;   // a service whose sound is DRA only
+ 
+ class Player {
+diff --git a/core/src/player.cpp b/core/src/player.cpp
+index 1ca6465..3a21a61 100644
+--- a/core/src/player.cpp
++++ b/core/src/player.cpp
+@@ -39,15 +39,21 @@ int avsProfileId(const uint8_t* p, size_t n) {
+     return -1;
+ }
+ 
+-std::string avsVideoNote(const std::string& codec, bool haveDecoder, int profile) {
++static bool decoderHasProfile(const AVCodec* c, int profile) {
++    for (const AVProfile* p = c ? c->profiles : nullptr; p && p->profile != AV_PROFILE_UNKNOWN; p++)
++        if (p->profile == profile) return true;
++    return false;
++}
++
++std::string avsVideoNote(const std::string& codec, bool haveDecoder, int profile, bool decoderHasProfile) {
+     if (codec == "avs2") return haveDecoder ? std::string() : "AVS2 video: this FFmpeg has no AVS2 decoder (it needs libdavs2), so there is no picture";
+     if (codec == "avs3") return haveDecoder ? std::string() : "AVS3 video: this FFmpeg has no AVS3 decoder (it needs libuavs3d), so there is no picture";
+     if (codec != "cavs") return std::string();
+     if (!haveDecoder) return "AVS video: this FFmpeg has no AVS decoder, so there is no picture";
+-    if (profile < 0 || profile == 0x20) return std::string();   // JiZhun: FFmpeg's cavs decoder plays it
+-    if (profile == 0x48) return "AVS+ video: FFmpeg decodes only the AVS JiZhun profile, not AVS+ (broadcast profile 0x48), so there is no picture";
++    if (profile < 0 || profile == 0x20 || decoderHasProfile) return std::string();   // JiZhun: every cavs decoder plays it
++    if (profile == 0x48) return "AVS+ video: this FFmpeg's cavs decoder decodes only the AVS JiZhun profile, not AVS+ (broadcast profile 0x48), so there is no picture";
+     char b[160];
+-    snprintf(b, sizeof b, "AVS video (profile 0x%02X): FFmpeg decodes only the AVS JiZhun profile, so there is no picture", profile);
++    snprintf(b, sizeof b, "AVS video (profile 0x%02X): this FFmpeg's cavs decoder decodes only the AVS JiZhun profile, so there is no picture", profile);
+     return b;
+ }
+ 
+@@ -454,7 +460,8 @@ void Player::threadMain() {
+         // ---- video decoder
+         AVCodecContext* vctx = nullptr;
+         bool hw = false;
+-        // the AVS family (DTMB in China): FFmpeg decodes AVS1-P2 in its JiZhun profile only, not AVS+; AVS2 and AVS3 need libdavs2 / libuavs3d
++        // the AVS family (DTMB in China): FFmpeg's own cavs decoder plays AVS1-P2 JiZhun only, AVS+ needs a cavs decoder that lists the Guangdian
++        // profile; AVS2 and AVS3 need libdavs2 / libuavs3d
+         const AVCodecID avsId = vIdx >= 0 ? fmt->streams[vIdx]->codecpar->codec_id : AV_CODEC_ID_NONE;
+         const bool avs = avsId == AV_CODEC_ID_CAVS || avsId == AV_CODEC_ID_AVS2 || avsId == AV_CODEC_ID_AVS3;
+         int avsProfile = -1;
+@@ -841,9 +848,10 @@ void Player::threadMain() {
+             if (getenv("DECT2_PLAYDEBUG")) { static int n = 0; if ((n++ % 100) == 0 || r < 0) fprintf(stderr, "[play] read r=%d idx=%d pts=%lld vq=%zu abuf=%d decoded=%llu\n", r, pkt->stream_index, (long long)pkt->pts, I.vq.size(), audio_.bufferedFrames(), (unsigned long long)I.st.decoded); }
+             if (r < 0) break;
+             if (avsId == AV_CODEC_ID_CAVS && avsProfile < 0 && pkt->stream_index == vIdx) {
+-                // the profile from the first sequence header: AVS+ (and anything else but JiZhun) is refused picture by picture, so say so instead
++                // the profile from the first sequence header: a cavs decoder that does not list the profile mis-decodes it picture by picture
++                // (FFmpeg's own one logs the refusal and goes on), so say so instead
+                 avsProfile = avsProfileId(pkt->data, (size_t)pkt->size);
+-                const std::string n = avsProfile >= 0 ? avsVideoNote("cavs", vctx != nullptr, avsProfile) : std::string();
++                const std::string n = avsProfile >= 0 ? avsVideoNote("cavs", vctx != nullptr, avsProfile, decoderHasProfile(vctx ? vctx->codec : nullptr, avsProfile)) : std::string();
+                 if (!n.empty()) {
+                     if (vctx) avcodec_free_context(&vctx);
+                     std::lock_guard<std::mutex> lk(I.smu);
+diff --git a/docs/CODECS.md b/docs/CODECS.md
+index 8b873d4..1500c67 100644
+--- a/docs/CODECS.md
++++ b/docs/CODECS.md
+@@ -130,8 +130,10 @@ DRA. These are Chinese patented codecs, and OnAir ships none of them: it plays w
+ - AVS1 in its JiZhun profile: FFmpeg's `cavs` decoder plays it (the macOS and Windows downloads; the Linux packages carry a smaller
+   FFmpeg without it).
+ - AVS+ (the broadcast profile, 0x48): FFmpeg's `cavs` decoder refuses it ("only support JiZhun profile", FFmpeg 8 and 9). OnAir lists
+-  the service as TV, plays its sound, and says in the player that there is no picture. There is no free AVS+ decoder to install at this
+-  time.
++  the service as TV, plays its sound, and says in the player that there is no picture. No distribution's FFmpeg decodes AVS+. The one
++  public decoder is the FFmpeg patch in <https://github.com/maliwen2015/ffmpeg_cavs_dra> (MIT-licensed repository; the decoder itself
++  carries no licence header, and AVS+ is patented): build FFmpeg with it and OnAir against that FFmpeg (`-DDECT2_FFMPEG_PREFIX`), and
++  OnAir plays AVS+. OnAir goes by the profiles the `cavs` decoder lists (`AVCodec::profiles`): FFmpeg's own lists none.
+ - AVS2 and AVS3: FFmpeg decodes them only when it is built with libdavs2 or libuavs3d, which the FFmpeg in OnAir is not. Save the stream
+   (Outputs: file or UDP) and play it with an FFmpeg build that has them (ffplay).
+ - DRA sound: FFmpeg has no DRA decoder. The player says "DRA audio: no decoder available"; a second sound track in another format plays.
+diff --git a/tests/test_ts.cpp b/tests/test_ts.cpp
+index 6d0f2fd..2974964 100644
+--- a/tests/test_ts.cpp
++++ b/tests/test_ts.cpp
+@@ -346,6 +346,7 @@ int main() {
+         CHECK(avsProfileId(es, 9) == -1, "a cut sequence header gave a profile");
+         CHECK(avsVideoNote("cavs", true, 0x20).empty() && avsVideoNote("cavs", true, -1).empty(), "JiZhun (or not known yet) must not get a note");
+         CHECK(avsVideoNote("cavs", true, 0x48).find("AVS+") != std::string::npos, "AVS+: '%s'", avsVideoNote("cavs", true, 0x48).c_str());
++        CHECK(avsVideoNote("cavs", true, 0x48, true).empty(), "a decoder that lists the AVS+ profile must not get a note");
+         CHECK(!avsVideoNote("cavs", false, -1).empty() && !avsVideoNote("avs2", false, -1).empty() && !avsVideoNote("avs3", false, -1).empty(), "a missing decoder must get a note");
+         CHECK(avsVideoNote("avs2", true, -1).empty() && avsVideoNote("h264", false, -1).empty(), "notes only for an AVS stream without a decoder");
+         CHECK(std::string(kDraAudioNote) == "DRA audio: no decoder available", "DRA note '%s'", kDraAudioNote);
+diff --git a/tools/package/make_dmg.sh b/tools/package/make_dmg.sh
+index 82182e2..722cb82 100755
+--- a/tools/package/make_dmg.sh
++++ b/tools/package/make_dmg.sh
+@@ -9,7 +9,8 @@ BUILD=build-release
+ # Homebrew dependencies from the macOS 15 release runners set the supported floor.
+ MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-15.0}
+ export MACOSX_DEPLOYMENT_TARGET
+-cmake -S . -B $BUILD -DCMAKE_BUILD_TYPE=Release -DDECT2_BUILD_TESTS=OFF -DDECT2_BUILD_APP=ON -DDECT2_HAVE_HAMLIB=ON -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" -DONAIR_VERSION="$VERSION"
++# DECT2_FFMPEG_PREFIX: build against a static FFmpeg in that folder (see CMakeLists.txt) instead of Homebrew's
++cmake -S . -B $BUILD -DCMAKE_BUILD_TYPE=Release -DDECT2_BUILD_TESTS=OFF -DDECT2_BUILD_APP=ON -DDECT2_HAVE_HAMLIB=ON -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" -DONAIR_VERSION="$VERSION" ${DECT2_FFMPEG_PREFIX:+-DDECT2_FFMPEG_PREFIX="$DECT2_FFMPEG_PREFIX"}
+ cmake --build $BUILD -j"$(sysctl -n hw.ncpu)" --target dect2
+ APP=$BUILD/OnAir.app
+ rm -rf "$APP"
