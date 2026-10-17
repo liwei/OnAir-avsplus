@@ -1,12 +1,14 @@
 # AVS+ video for OnAir (DTMB television in China)
 
 Patches and build scripts that make [OnAir](https://github.com/adswill/OnAir) show the picture of
-DTMB channels whose video is AVS+, on macOS. OnAir out of the box plays the sound of such a channel
-and says "AVS+ video: FFmpeg decodes only the AVS JiZhun profile, not AVS+ (broadcast profile 0x48),
-so there is no picture".
+DTMB channels whose video is AVS+. OnAir out of the box plays the sound of such a channel and says
+"AVS+ video: FFmpeg decodes only the AVS JiZhun profile, not AVS+ (broadcast profile 0x48), so there
+is no picture".
 
 Tested on 2026-10-17 with a HackRF One on an Apple M4 Mac mini (macOS 27.0.1), on the Jiangsu
-(JSBC) multiplex: the JSCS channel plays with picture and sound.
+(JSBC) multiplex: the JSCS channel plays with picture and sound. The Linux packages are built and
+checked on x86-64 (decoder and test suite, no DTMB signal at hand); the Windows programs are
+cross-compiled and checked under Wine only.
 
 ## Why there is no picture
 
@@ -59,15 +61,31 @@ stream selection in applications need no change. Compared with the upstream patc
   again.
 - `tools/package/make_dmg.sh`: passes a `DECT2_FFMPEG_PREFIX` environment variable on to CMake, so
   the packaged OnAir.app uses the patched FFmpeg instead of Homebrew's.
+- `tools/package/build_ffmpeg_static.sh` (the static FFmpeg of the Linux packages): FFmpeg 7.1.2
+  instead of 8.0, the patch applied from `tools/package/patches/`, and the `cavs` decoder and
+  `cavsvideo` parser added to its component list (it had no AVS decoder at all, so the Linux
+  packages showed no picture even for plain AVS channels). `make_deb.sh` looks for the 7.1.2 tarball.
+- `tools/package/cross_deps_windows.sh` (the FFmpeg of the Windows cross-build): the same version
+  change and patch step.
 
-## How to build (macOS, Apple Silicon or Intel)
+The OnAir patch expects `avsplus-ffmpeg-7.1.2.patch` at `tools/package/patches/` in the OnAir
+tree; the scripts below copy it there.
+
+## How to build
+
+All scripts work in `~/avsplus`:
+
+```sh
+mkdir -p ~/avsplus && cp -r patches/* scripts/* ~/avsplus/
+cd ~/avsplus
+```
+
+### macOS (Apple Silicon or Intel)
 
 Needs the Xcode command line tools and Homebrew with
 `cmake pkg-config hackrf soapysdr libusb glfw` (`nasm` too on Intel).
 
 ```sh
-mkdir -p ~/avsplus && cp patches/* scripts/* ~/avsplus/
-cd ~/avsplus
 curl -fsSLO https://ffmpeg.org/releases/ffmpeg-7.1.2.tar.xz   # the script checks its SHA-256
 bash build_ffmpeg_macos.sh     # FFmpeg 7.1.2 + AVS+, static, into ~/avsplus/ffmpeg-prefix
 bash build_onair_macos.sh      # OnAir at commit 5003cf20 + patch, built against it; runs test_ts
@@ -78,6 +96,30 @@ bash make_app_macos.sh         # OnAir.app and a .dmg in ~/avsplus/OnAir/build-r
 signed ad hoc, so macOS asks once on first launch. It has the same bundle identifier as the official
 OnAir.app; keep them in different folders or replace the official one knowingly.
 
+### Linux (.deb, .tar.gz and portable packages)
+
+Needs Docker and git; everything else happens in OnAir's own build container (Ubuntu 22.04, so the
+packages run on anything newer).
+
+```sh
+bash build_linux_packages.sh   # ~/avsplus/OnAir/build-packages/onair_<v>_<arch>.deb and the tarballs
+```
+
+This is OnAir's `make_deb.sh` on the patched tree. `PLATFORM=linux/arm64` (or `linux/amd64`) builds
+the other architecture under emulation, as the script documents. The static FFmpeg it builds is
+cached in a Docker volume; the script removes a stale one first.
+
+### Windows (cross-compile check)
+
+Needs Docker and git. Builds OnAir's Windows programs with mingw-w64 in a container and runs the
+test suite and the decoder check under Wine. It is a build check with the HackRF driver only, not the
+official package with every radio library; packaging those is OnAir's `make_windows_cross.sh`, which
+needs all of its dependency archives.
+
+```sh
+bash crossbuild_windows.sh     # ~/avsplus/wincross/work/onair-build/{dect2,dect2cli,test_ts}.exe
+```
+
 Checking the decoder alone: record the channel from OnAir (TV tab, **Record**) and run
 `~/avsplus/ffmpeg-prefix/bin/ffmpeg -i recording.ts -an -c:v rawvideo -f rawvideo -y /dev/null`.
 A working decoder reports the frame count with no decoder errors; a stock ffmpeg shows nothing but
@@ -85,13 +127,18 @@ A working decoder reports the frame count with no decoder errors; a stock ffmpeg
 
 ## What was verified
 
-- The patched FFmpeg builds on Linux (GCC 13) and macOS (Apple clang 21) and, configured with
-  nothing but the `cavs` decoder, links on its own.
-- A 19-second recording of JSCS (profile byte 0x48) decodes to 471 frames on both machines with
-  no decoder errors; the frames are clean pictures.
+- The patched FFmpeg builds on Linux (GCC 13), macOS (Apple clang 21) and for Windows x64
+  (mingw-w64 GCC 13) and, configured with nothing but the `cavs` decoder, links on its own.
+- A 19-second recording of JSCS (profile byte 0x48) decodes with no decoder errors on all three:
+  the same 295 pictures from the static FFmpeg of the Linux package and from the Windows build under
+  Wine, clean pictures when viewed.
 - The decoder's profile table is visible through `avcodec_find_decoder(AV_CODEC_ID_CAVS)->profiles`.
 - OnAir builds against it on macOS with FFmpeg linked statically; its `test_ts` suite passes; the
   live DTMB channel shows a picture in the player.
+- The Linux `.deb` and portable packages build in OnAir's container with the patched static FFmpeg
+  inside (no FFmpeg shared-library dependency); `test_ts` passes there.
+- The Windows `dect2.exe`, `dect2cli.exe` and `test_ts.exe` cross-compile; `test_ts.exe` passes under
+  Wine. No Windows machine or radio was involved.
 
 ## Caveats
 
@@ -120,3 +167,6 @@ projects' licences; the decoder the FFmpeg patch adds has the provenance describ
 | `scripts/build_ffmpeg_macos.sh` | FFmpeg 7.1.2 + patch, static, for OnAir |
 | `scripts/build_onair_macos.sh` | OnAir + patch against that FFmpeg, runs `test_ts` |
 | `scripts/make_app_macos.sh` | OnAir.app and .dmg via OnAir's `make_dmg.sh` |
+| `scripts/build_linux_packages.sh` | the Linux packages via OnAir's `make_deb.sh` (Docker) |
+| `scripts/crossbuild_windows.sh` | Windows cross-compile check (Docker, mingw-w64, Wine) |
+| `scripts/wincross/` | the container, its build steps and the decoder check program for the above |

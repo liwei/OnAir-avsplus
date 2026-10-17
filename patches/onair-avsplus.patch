@@ -110,12 +110,16 @@ index 1ca6465..3a21a61 100644
                      if (vctx) avcodec_free_context(&vctx);
                      std::lock_guard<std::mutex> lk(I.smu);
 diff --git a/docs/CODECS.md b/docs/CODECS.md
-index 8b873d4..1500c67 100644
+index 8b873d4..73091f2 100644
 --- a/docs/CODECS.md
 +++ b/docs/CODECS.md
-@@ -130,8 +130,10 @@ DRA. These are Chinese patented codecs, and OnAir ships none of them: it plays w
- - AVS1 in its JiZhun profile: FFmpeg's `cavs` decoder plays it (the macOS and Windows downloads; the Linux packages carry a smaller
-   FFmpeg without it).
+@@ -127,11 +127,12 @@ DRA+ decoder to install at this time. You can save the raw sound with **Save str
+ DTMB channels in China send their pictures as AVS+ (stream type 0x42; some as AVS2, 0xD2, or AVS3, 0xD4) and some send their sound as
+ DRA. These are Chinese patented codecs, and OnAir ships none of them: it plays what the FFmpeg built into it can decode.
+ 
+-- AVS1 in its JiZhun profile: FFmpeg's `cavs` decoder plays it (the macOS and Windows downloads; the Linux packages carry a smaller
+-  FFmpeg without it).
++- AVS1 in its JiZhun profile: FFmpeg's `cavs` decoder plays it.
  - AVS+ (the broadcast profile, 0x48): FFmpeg's `cavs` decoder refuses it ("only support JiZhun profile", FFmpeg 8 and 9). OnAir lists
 -  the service as TV, plays its sound, and says in the player that there is no picture. There is no free AVS+ decoder to install at this
 -  time.
@@ -138,6 +142,73 @@ index 6d0f2fd..2974964 100644
          CHECK(!avsVideoNote("cavs", false, -1).empty() && !avsVideoNote("avs2", false, -1).empty() && !avsVideoNote("avs3", false, -1).empty(), "a missing decoder must get a note");
          CHECK(avsVideoNote("avs2", true, -1).empty() && avsVideoNote("h264", false, -1).empty(), "notes only for an AVS stream without a decoder");
          CHECK(std::string(kDraAudioNote) == "DRA audio: no decoder available", "DRA note '%s'", kDraAudioNote);
+diff --git a/tools/package/build_ffmpeg_static.sh b/tools/package/build_ffmpeg_static.sh
+index 8ac69e9..540ae8c 100755
+--- a/tools/package/build_ffmpeg_static.sh
++++ b/tools/package/build_ffmpeg_static.sh
+@@ -1,11 +1,11 @@
+ #!/bin/bash
+ # Builds a small static FFmpeg with only what OnAir uses, so that the Linux packages need no FFmpeg from the system (system FFmpeg
+ # versions change with every Linux release and a package built against one does not install on the next).
+-#   tools/package/build_ffmpeg_static.sh <prefix> [ffmpeg-8.0.tar.xz]
++#   tools/package/build_ffmpeg_static.sh <prefix> [ffmpeg-7.1.2.tar.xz]
+ # Then build OnAir with -DDECT2_FFMPEG_PREFIX=<prefix>. Needs a C compiler, make and nasm (on x86-64); downloads the source when no tarball is given.
+ set -e
+ PREFIX=${1:?usage: build_ffmpeg_static.sh <prefix> [tarball]}
+-VER=8.0
++VER=7.1.2
+ TARBALL=${2:-}
+ WORK=$(mktemp -d)
+ trap 'rm -rf "$WORK"' EXIT
+@@ -14,6 +14,8 @@ if [ -z "$TARBALL" ]; then
+   curl -fsSL -o "$TARBALL" "https://ffmpeg.org/releases/ffmpeg-$VER.tar.xz"
+ fi
+ tar -xf "$TARBALL" -C "$WORK"
++# the cavs decoder that plays AVS+ (AVS1 Guangdian profile, DTMB television in China; docs/CODECS.md)
++patch -s -d "$WORK/ffmpeg-$VER" -p1 < "$(cd "$(dirname "$0")" && pwd)/patches/avsplus-ffmpeg-$VER.patch"
+ mkdir "$WORK/build" && cd "$WORK/build"
+ ASM=
+ [ "$(uname -m)" = "x86_64" ] && ! command -v nasm >/dev/null && { echo "nasm is needed for the fast x86-64 code"; exit 1; }
+@@ -24,8 +26,8 @@ ASM=
+   --enable-protocol=file \
+   --enable-demuxer=mpegts,mov \
+   --enable-muxer=mpegts,hls,mp4 \
+-  --enable-parser=h264,hevc,mpegvideo,mpegaudio,aac,aac_latm,ac3,dvbsub \
+-  --enable-decoder=h264,hevc,mpeg2video,mp2,mp2float,mp3,mp3float,ac3,eac3,aac,aac_latm,dvbsub \
++  --enable-parser=h264,hevc,mpegvideo,mpegaudio,aac,aac_latm,ac3,dvbsub,cavsvideo \
++  --enable-decoder=h264,hevc,mpeg2video,mp2,mp2float,mp3,mp3float,ac3,eac3,aac,aac_latm,dvbsub,cavs \
+   --enable-encoder=mpeg2video,mp2,aac \
+   --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,aac_adtstoasc,extract_extradata,null,setts,dts2pts \
+   > "$WORK/configure.log" 2>&1 || { tail -30 "$WORK/configure.log"; exit 1; }
+diff --git a/tools/package/cross_deps_windows.sh b/tools/package/cross_deps_windows.sh
+index eb066cb..3434741 100755
+--- a/tools/package/cross_deps_windows.sh
++++ b/tools/package/cross_deps_windows.sh
+@@ -45,7 +45,10 @@ Cflags: -I\${includedir}/libhackrf -DLIBHACKRF_STATIC
+ PC
+ }
+ 
+-[ -f "$P/lib/libavcodec.a" ] || { step ffmpeg; unpack ffmpeg-8.0.tar.xz ffmpeg-8.0; mkdir -p ffmpeg-build; (cd ffmpeg-build && ../ffmpeg-8.0/configure --prefix=$P --enable-cross-compile --target-os=mingw32 --arch=x86_64 --cross-prefix=$HOST- \
++[ -f "$P/lib/libavcodec.a" ] || { step ffmpeg; unpack ffmpeg-7.1.2.tar.xz ffmpeg-7.1.2
++  # the cavs decoder that plays AVS+ (AVS1 Guangdian profile, DTMB television in China; docs/CODECS.md)
++  [ -f ffmpeg-7.1.2/.onair-patched ] || { patch -s -d ffmpeg-7.1.2 -p1 < "$ROOT/tools/package/patches/avsplus-ffmpeg-7.1.2.patch"; touch ffmpeg-7.1.2/.onair-patched; }
++  mkdir -p ffmpeg-build; (cd ffmpeg-build && ../ffmpeg-7.1.2/configure --prefix=$P --enable-cross-compile --target-os=mingw32 --arch=x86_64 --cross-prefix=$HOST- \
+     --enable-static --disable-shared --disable-programs --disable-doc --disable-debug --disable-avdevice --disable-network --pkg-config=pkg-config --extra-cflags="-I$P/include" --extra-ldflags="-L$P/lib" >/dev/null && make -j$JOBS >/dev/null && make install >/dev/null); }
+ 
+ # --- generic radios: SoapySDR (a DLL). Its RTL-SDR and Airspy modules are not built: the native drivers of the same name always win and hide them.
+diff --git a/tools/package/make_deb.sh b/tools/package/make_deb.sh
+index ab71870..0a56180 100755
+--- a/tools/package/make_deb.sh
++++ b/tools/package/make_deb.sh
+@@ -25,7 +25,7 @@ fi
+ mkdir -p build-packages
+ # the FFmpeg source: use a copy that is already on this computer when there is one, otherwise the container downloads it
+ FFSRC=
+-for f in build-windows-deps/src/ffmpeg-8.0.tar.xz tools/package/cache/ffmpeg-8.0.tar.xz; do [ -f "$f" ] && FFSRC="/src/$f" && break; done
++for f in build-windows-deps/src/ffmpeg-7.1.2.tar.xz tools/package/cache/ffmpeg-7.1.2.tar.xz; do [ -f "$f" ] && FFSRC="/src/$f" && break; done
+ # under emulation a compiler can run out of memory with many jobs at once: build FFmpeg with few
+ JOBS=; [ -n "$PLATFORM" ] && JOBS="-e FFMPEG_JOBS=4"
+ docker run --rm $PF $JOBS -v "$PWD":/src:ro -v $VOL:/build -v $FFV:/ffmpeg -v "$PWD/build-packages":/out -w /build $IMAGE bash -c '
 diff --git a/tools/package/make_dmg.sh b/tools/package/make_dmg.sh
 index 82182e2..722cb82 100755
 --- a/tools/package/make_dmg.sh
