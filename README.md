@@ -105,6 +105,12 @@ A working decoder reports the frame count with no decoder errors; a stock ffmpeg
 - The FFmpeg patch is against 7.1.2. OnAir's official downloads use FFmpeg 8; the patch has not been
   tried on 8.x.
 
+## License
+
+The build scripts and this document are under the Apache License 2.0 (`LICENSE`). The patches
+modify FFmpeg (LGPL-2.1-or-later) and OnAir (GPL-3.0-or-later) and are offered under those
+projects' licences; the decoder the FFmpeg patch adds has the provenance described under Caveats.
+
 ## Files
 
 | File | What |
